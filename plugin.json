@@ -1,0 +1,12 @@
+{
+  "name": "token-pulse",
+  "displayName": "Token Pulse",
+  "description": "Native Antigravity telemetry panel: live context window usage, cache hit rate, latency, 5h rolling pace, and 7-day model/project analytics.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "打开 Token Pulse 侧边栏查看当前上下文占用和缓存命中率",
+    "打开 Token Pulse 趋势面板分析近 7 天各模型消耗分布",
+    "检查 Token Pulse 本地会话数据扫描与诊断状态"
+  ]
+}

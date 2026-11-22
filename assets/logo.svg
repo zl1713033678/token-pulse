@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <!-- Outer subtle track ring (works on both light and dark themes) -->
+  <circle cx="64" cy="64" r="46" stroke="#64748b" stroke-opacity="0.28" stroke-width="9" />
+  <!-- Active telemetry arc -->
+  <path
+    d="M 64 18 A 46 46 0 1 1 24.16 87"
+    stroke="#2563eb"
+    stroke-width="9"
+    stroke-linecap="round"
+  />
+  <!-- Inner pulse waveform -->
+  <path
+    d="M 33 66 L 46 66 L 54 44 L 65 84 L 74 56 L 81 66 L 95 66"
+    stroke="#38bdf8"
+    stroke-width="6.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- Center status node -->
+  <circle cx="95" cy="66" r="4.5" fill="#2563eb" />
+</svg>

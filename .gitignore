@@ -1,0 +1,17 @@
+# Dependencies & build artifacts
+node_modules/
+dist/
+
+# Runtime SQLite databases & sidecars
+*.db
+*.db-wal
+*.db-shm
+
+# Local environment & logs
+.env
+.env.local
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
