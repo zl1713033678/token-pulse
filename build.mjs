@@ -58,10 +58,15 @@ async function build() {
     fs.copyFileSync(src, dst);
   }
 
-  // Deploy zero-dependency plugin bundle to ~/.gemini/config/plugins/token-pulse/
-  fs.rmSync(DEPLOY_DIR, { recursive: true, force: true });
+  // Deploy zero-dependency plugin bundle in-place (avoids Windows EPERM when MCP host holds DEPLOY_DIR CWD)
   fs.mkdirSync(DEPLOY_DIR, { recursive: true });
-  fs.cpSync(DIST_DIR, DEPLOY_DIR, { recursive: true });
+  const distTopEntries = new Set(fs.readdirSync(DIST_DIR));
+  for (const existing of fs.readdirSync(DEPLOY_DIR)) {
+    if (!distTopEntries.has(existing)) {
+      fs.rmSync(path.join(DEPLOY_DIR, existing), { recursive: true, force: true });
+    }
+  }
+  fs.cpSync(DIST_DIR, DEPLOY_DIR, { recursive: true, force: true });
 
   console.log(`Built dist/ui/dashboard.html (${(htmlBytes / 1024).toFixed(1)} KB)`);
   console.log(`Deployed plugin bundle to ${DEPLOY_DIR}`);

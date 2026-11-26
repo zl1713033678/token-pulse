@@ -6,7 +6,7 @@ import {
 } from '@modelcontextprotocol/ext-apps';
 
 const state = {
-  activeTab: 'overview',
+  activeTab: 'live',
   surface: 'all',
   selectedSessionId: null,
   privacyMask: false,
@@ -14,12 +14,10 @@ const state = {
   analyticsFamily: 'all',
   drillMode: 'model',
   selectedChartDayIdx: null,
+  openFolds: new Set(),
   snapshot: null,
   analytics: null,
   diagnostics: null,
-  canSendMessage: false,
-  compactState: 'idle', // idle | sending | sent | error
-  compactMessage: '',
   loadingSnapshot: false,
   loadingAnalytics: false,
   loadingDiagnostics: false,
@@ -28,12 +26,12 @@ const state = {
 
 const FAMILY_LABELS = {
   gemini4: 'Gemini 4',
-  flash: 'Flash / Subagent',
   claude: 'Claude',
+  flash: 'Flash / Subagent',
   other: 'Other',
 };
 
-const TAB_ORDER = ['overview', 'context', 'pace', 'trends'];
+const TAB_ORDER = ['live', 'trends'];
 
 function esc(value) {
   return String(value ?? '')
@@ -62,19 +60,49 @@ function fmtSec(s) {
   return s >= 10 ? `${s.toFixed(1)}s` : `${s.toFixed(2)}s`;
 }
 
+function fmtTps(tps) {
+  if (!Number.isFinite(tps) || tps <= 0) return '—';
+  return `${tps >= 100 ? Math.round(tps) : tps.toFixed(1)} tok/s`;
+}
+
+function calcCacheHitPct(inputTokens, cacheReadTokens, precomputed) {
+  if (Number.isFinite(precomputed)) return precomputed;
+  const denom = (Number(inputTokens) || 0) + (Number(cacheReadTokens) || 0);
+  if (denom <= 0) return 0;
+  return Math.round(((Number(cacheReadTokens) || 0) / denom) * 1000) / 10;
+}
+
 function fmtRelativeTime(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return '未知';
   const diffSec = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (diffSec < 60) return '刚刚';
+  if (diffSec < 45) return '刚刚';
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m 前`;
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h 前`;
   return `${Math.floor(diffSec / 86400)}d 前`;
+}
+
+function fmtCountdownMs(deltaMs) {
+  if (!Number.isFinite(deltaMs) || deltaMs <= 0) return '即将更新';
+  const totalSec = Math.max(1, Math.round(deltaMs / 1000));
+  if (totalSec < 60) return `${totalSec}s`;
+  const totalMin = Math.floor(totalSec / 60);
+  if (totalMin < 60) return `${totalMin}m`;
+  const hours = Math.floor(totalMin / 60);
+  const mins = totalMin % 60;
+  if (hours < 24) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
 }
 
 function maskText(text, fallbackLabel = '已隐藏') {
   if (!state.privacyMask) return text;
   if (!text) return fallbackLabel;
   return `${text.slice(0, 2)}•••`;
+}
+
+function normalizeTabName(raw) {
+  return raw === 'trends' ? 'trends' : 'live';
 }
 
 function applyHostThemeContext(ctx) {
@@ -91,27 +119,28 @@ function applyHostThemeContext(ctx) {
   }
 }
 
-function buildRingSvg(pct, alertLevel, sizeClass = '') {
+function buildMiniRingSvg(pct, alertLevel) {
   const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
-  const r = 19;
+  const r = 14;
   const circ = 2 * Math.PI * r;
   const offset = circ * (1 - clamped / 100);
-  const strokeCls = alertLevel === 'danger' ? 'ring-fill danger' : alertLevel === 'warn' ? 'ring-fill warn' : 'ring-fill';
+  const strokeCls =
+    alertLevel === 'danger' ? 'ring-fill danger' : alertLevel === 'warn' ? 'ring-fill warn' : 'ring-fill';
 
   return `
-    <div class="ring-wrap ${sizeClass}">
-      <svg viewBox="0 0 48 48" aria-hidden="true">
-        <circle class="ring-track" cx="24" cy="24" r="${r}" stroke-width="4.5" />
-        <circle class="${strokeCls}" cx="24" cy="24" r="${r}" stroke-width="4.5"
+    <div class="ring-mini" aria-hidden="true">
+      <svg viewBox="0 0 36 36">
+        <circle class="ring-track" cx="18" cy="18" r="${r}" stroke-width="3.6" />
+        <circle class="${strokeCls}" cx="18" cy="18" r="${r}" stroke-width="3.6"
           stroke-dasharray="${circ.toFixed(2)}"
           stroke-dashoffset="${offset.toFixed(2)}" />
       </svg>
-      <div class="ring-center num">${Math.round(clamped)}%</div>
+      <div class="ring-mini-center num">${Math.round(clamped)}%</div>
     </div>
   `;
 }
 
-function buildStackedChart(buckets, { large = false, selectedIdx = null, familyFilter = 'all', clickable = false } = {}) {
+function buildStackedChart(buckets, { selectedIdx = null, familyFilter = 'all', clickable = false } = {}) {
   if (!buckets || buckets.length === 0) {
     return '<div class="empty-state">暂无统计周期内的消耗记录</div>';
   }
@@ -129,7 +158,7 @@ function buildStackedChart(buckets, { large = false, selectedIdx = null, familyF
 
   const itemsHtml = buckets
     .map((b, idx) => {
-      const value = familyFilter !== 'all' ? (b.families?.[familyFilter] || 0) : (b.totalTokens || 0);
+      const value = familyFilter !== 'all' ? b.families?.[familyFilter] || 0 : b.totalTokens || 0;
       const heightPct = value > 0 ? Math.max(4, Math.round((value / maxTotal) * 100)) : 0;
       const segs = familyOrder
         .filter((f) => familyFilter === 'all' || familyFilter === f)
@@ -143,7 +172,8 @@ function buildStackedChart(buckets, { large = false, selectedIdx = null, familyF
 
       const showLabel = cols <= 7 || idx === 0 || idx === cols - 1 || idx % Math.ceil(cols / 6) === 0;
       const isSelected = clickable && selectedIdx === idx;
-      const titleTip = `${b.dateLabel || b.label}: ${fmtTokens(value)} tokens (${b.turnsCount || 0} 轮)`;
+      const dayHitPct = calcCacheHitPct(b.inputTokens, b.cacheReadTokens, b.cacheHitRate);
+      const titleTip = `${b.dateLabel || b.label}: ${fmtTokens(value)} tokens (${b.turnsCount || 0} 轮 · 缓存 ${fmtTokens(b.cacheReadTokens)} (命中${dayHitPct}%))`;
 
       return `
         <button type="button" class="bar-col ${isSelected ? 'selected' : ''}"
@@ -155,22 +185,25 @@ function buildStackedChart(buckets, { large = false, selectedIdx = null, familyF
     })
     .join('');
 
-  return `<div class="stacked-chart ${large ? 'lg' : ''}" style="grid-template-columns: repeat(${cols}, minmax(0, 1fr))">${itemsHtml}</div>`;
+  return `<div class="stacked-chart" style="grid-template-columns: repeat(${cols}, minmax(0, 1fr))">${itemsHtml}</div>`;
 }
 
-function renderHeaderAndFilters() {
+function renderTopToolbar() {
   const snap = state.snapshot;
   const active = snap?.activeSession;
-  const subEl = document.getElementById('header-sub');
-  const badgeEl = document.getElementById('env-badge');
   const syncEl = document.getElementById('sync-label');
+  const dotEl = document.getElementById('status-dot');
+  const selectEl = document.getElementById('session-select');
   const privacyBtn = document.getElementById('btn-privacy');
-  const privacyLabel = document.getElementById('privacy-label');
 
-  if (privacyBtn && privacyLabel) {
+  if (privacyBtn) {
     privacyBtn.setAttribute('aria-pressed', String(state.privacyMask));
-    privacyLabel.textContent = state.privacyMask ? '已脱敏' : '脱敏';
+    privacyBtn.title = state.privacyMask ? '已开启隐私脱敏（点击恢复显示）' : '切换项目与会话名称隐私脱敏';
   }
+
+  document.querySelectorAll('.pill-btn[data-surface]').forEach((btn) => {
+    btn.setAttribute('aria-pressed', String(btn.dataset.surface === state.surface));
+  });
 
   if (snap) {
     const counts = snap.surfaceCounts || {};
@@ -178,372 +211,420 @@ function renderHeaderAndFilters() {
     document.getElementById('count-desktop').textContent = counts.desktop ?? '';
     document.getElementById('count-cli').textContent = counts.cli ?? '';
     syncEl.textContent = fmtRelativeTime(snap.syncedAt);
+  } else if (state.errorText) {
+    syncEl.textContent = '离线';
   }
 
-  document.querySelectorAll('.pill-btn[data-surface]').forEach((btn) => {
-    btn.setAttribute('aria-pressed', String(btn.dataset.surface === state.surface));
-  });
+  if (dotEl) {
+    dotEl.className = 'sync-dot';
+    if (state.errorText) dotEl.classList.add('offline');
+    else if (active?.status === 'CASCADE_RUN_STATUS_RUNNING') dotEl.classList.add('running');
+  }
 
-  if (active) {
-    const proj = maskText(active.project, '已隐藏项目');
-    const sess = maskText(active.title, '当前会话');
-    subEl.textContent = `${proj} · ${sess}`;
-    badgeEl.textContent = active.surface === 'cli' ? 'CLI' : active.isCurrentEnv ? '当前对话' : 'Desktop';
-  } else if (state.errorText) {
-    subEl.textContent = state.errorText;
-    badgeEl.textContent = 'Offline';
-  } else if (snap) {
-    subEl.textContent = '当前过滤下暂无会话';
-    badgeEl.textContent = state.surface.toUpperCase();
+  // Avoid clobbering <select> while user is actively interacting with it
+  if (selectEl && document.activeElement !== selectEl) {
+    const sessions = snap?.recentSessions || [];
+    if (sessions.length > 0 && active) {
+      selectEl.disabled = false;
+      selectEl.innerHTML = sessions
+        .map((s) => {
+          const prefix = s.isCurrentEnv ? '[当前] ' : s.surface === 'cli' ? '[CLI] ' : '';
+          const proj = maskText(s.project, '项目');
+          const title = maskText(s.title, '会话');
+          const label = `${prefix}${proj} · ${title} (${s.contextPct}%)`;
+          const selected = s.id === active.id ? 'selected' : '';
+          return `<option value="${esc(s.id)}" ${selected}>${esc(label)}</option>`;
+        })
+        .join('');
+    } else {
+      selectEl.disabled = true;
+      selectEl.innerHTML = `<option value="">${esc(state.errorText || '当前过滤下暂无会话记录')}</option>`;
+    }
   }
 }
 
-function renderOverview() {
-  const root = document.getElementById('body-overview');
+function renderLive() {
+  const root = document.getElementById('body-live');
   const snap = state.snapshot;
   if (!snap) {
-    root.innerHTML = `<div class="card empty-state">${esc(state.errorText || '正在扫描本地 Antigravity 会话数据…')}</div>`;
+    root.innerHTML = `<div class="card empty-state">${esc(state.errorText || '正在只读扫描本地 Antigravity 会话库…')}</div>`;
     return;
   }
 
+  const nowMs = Date.now();
   const active = snap.activeSession;
   const today = snap.today;
   const r5 = snap.rolling5h;
-  const max5h = Math.max(1, ...r5.buckets.map((b) => b.totalTokens));
+  const calWeek = snap.calendarWeek || {
+    resetAtMs: nowMs + 86_400_000,
+    totalTokens: snap.weekSummary?.totalTokens || 0,
+    turnsCount: 0,
+    sessionsCount: 0,
+  };
+  const pools = snap.quotaPools || [];
 
-  const ctxCardHtml = active
-    ? `
-      <section class="card">
-        <div class="card-head">
-          <span class="card-title">当前上下文</span>
-          <span class="card-meta ${active.alertLevel}">${active.contextPct}%</span>
-        </div>
-        <div class="ring-row">
-          ${buildRingSvg(active.contextPct, active.alertLevel)}
-          <div style="min-width:0">
-            <div class="metric-main num">${fmtTokens(active.contextUsed)} / ${fmtTokens(active.contextLimit)}</div>
-            <div class="metric-sub" title="${esc(active.modelLabel)}">${esc(active.modelLabel)}</div>
+  // 1. Top DSH-style Live Strip (when an active session exists)
+  let stripHtml = '';
+  let ctxCardHtml = '';
+
+  if (active) {
+    const stepCount = active.stepCount || active.turnsCount;
+    const primaryTps = active.lastTps > 0 ? fmtTps(active.lastTps) : fmtTps(active.avgTps);
+    const subSpeed =
+      active.avgTps > 0
+        ? `均值 ${fmtTps(active.avgTps)} · TTFT ${fmtSec(active.avgTtftSec)}`
+        : `平均首字 TTFT ${fmtSec(active.avgTtftSec)}`;
+    const ctxToneCls =
+      active.alertLevel === 'danger'
+        ? 'strip-danger'
+        : active.alertLevel === 'warn'
+          ? 'strip-warn'
+          : 'strip-accent';
+
+    stripHtml = `
+      <section class="live-strip" aria-label="当前会话核心指标">
+        <div class="strip-cell">
+          <div class="strip-copy">
+            <div class="strip-primary num">
+              <span>${active.turnsCount} 轮 ${stepCount} 步</span>
+              <span>·</span>
+              <span class="strip-accent">${esc(primaryTps)}</span>
+            </div>
+            <div class="strip-sub num">${esc(subSpeed)}</div>
           </div>
         </div>
-        <button type="button" class="link-btn" data-goto-tab="context">查看明细 / 一键压缩 →</button>
+
+        <div class="strip-cell">
+          <div class="strip-copy">
+            <div class="strip-primary num">
+              <span>${fmtTokens(active.totalTokens)} tok</span>
+              <span>·</span>
+              <span class="strip-ok">缓存 ${active.cacheHitRate}%</span>
+            </div>
+            <div class="strip-sub num">未命中 ${fmtTokens(active.inputTokens)} · 读取 ${fmtTokens(active.cacheReadTokens)}</div>
+          </div>
+        </div>
+
+        <div class="strip-cell">
+          <div class="strip-copy">
+            <div class="strip-primary num">
+              <span>上下文</span>
+              <span class="${ctxToneCls}">${active.contextPct}%</span>
+            </div>
+            <div class="strip-sub num">${fmtTokens(active.contextUsed)} / ${fmtTokens(active.contextLimit)}</div>
+          </div>
+          ${buildMiniRingSvg(active.contextPct, active.alertLevel)}
+        </div>
       </section>
-    `
-    : `
+    `;
+
+    // Context Window + Inline Breakdown Card
+    const remaining = Math.max(0, active.contextLimit - active.contextUsed);
+    const clampedPct = Math.max(0, Math.min(100, Number(active.contextPct) || 0));
+    const meterFillCls =
+      active.alertLevel === 'danger'
+        ? 'ctx-meter-fill danger'
+        : active.alertLevel === 'warn'
+          ? 'ctx-meter-fill warn'
+          : 'ctx-meter-fill';
+
+    const statusBadgeCls =
+      active.alertLevel === 'danger'
+        ? 'badge-pill danger'
+        : active.alertLevel === 'warn'
+          ? 'badge-pill warn'
+          : 'badge-pill accent';
+    const statusBadgeText =
+      active.alertLevel === 'danger'
+        ? '建议立即压缩'
+        : active.alertLevel === 'warn'
+          ? '接近高水位'
+          : `余量 ${fmtTokens(remaining)}`;
+
+    const compactNoticeCls =
+      active.alertLevel === 'danger'
+        ? 'compact-notice danger'
+        : active.alertLevel === 'warn'
+          ? 'compact-notice warn'
+          : 'compact-notice';
+    const compactNoticeHtml =
+      active.alertLevel === 'danger'
+        ? `<div class="${compactNoticeCls}" role="note">上下文已达高水位（${active.contextPct}%）：请在聊天输入框输入 <code class="cmd-chip">/compact</code> 并从命令菜单选择，以压缩历史释放空间。</div>`
+        : active.alertLevel === 'warn'
+          ? `<div class="${compactNoticeCls}" role="note">上下文已超过预警线（${active.contextPct}%）：可在聊天输入框输入 <code class="cmd-chip">/compact</code> 并从命令菜单选择以提前释放空间。</div>`
+          : `<div class="${compactNoticeCls}" role="note">需要释放上下文时，请在聊天输入框输入 <code class="cmd-chip">/compact</code> 并从命令菜单选择执行。</div>`;
+
+    const composedTotal = Math.max(
+      1,
+      active.cacheReadTokens +
+        active.inputTokens +
+        (active.cacheWriteTokens || 0) +
+        active.thinkingTokens +
+        active.textTokens
+    );
+
+    const breakdownItems = [
+      { label: '缓存读取', val: active.cacheReadTokens, color: 'var(--ok)' },
+      { label: '未命中输入', val: active.inputTokens, color: 'var(--accent)' },
+      ...(active.cacheWriteTokens > 0
+        ? [{ label: '缓存写入', val: active.cacheWriteTokens, color: 'var(--write-tone)' }]
+        : []),
+      { label: '思考推理', val: active.thinkingTokens, color: 'var(--warn)' },
+      { label: '可见输出', val: active.textTokens, color: 'var(--fg-muted)' },
+    ];
+
+    const segsHtml = breakdownItems
+      .map((item) => {
+        if (item.val <= 0) return '';
+        const pct = Math.max(1, (item.val / composedTotal) * 100);
+        return `<span class="progress-seg" style="width:${pct.toFixed(1)}%; background:${item.color}"></span>`;
+      })
+      .join('');
+
+    const compGridHtml = breakdownItems
+      .map((item) => {
+        const pct = Math.round((item.val / composedTotal) * 1000) / 10;
+        return `
+          <div class="comp-item">
+            <span class="kv-name"><span class="swatch" style="background:${item.color}"></span>${esc(item.label)}</span>
+            <span class="kv-val num">${fmtExact(item.val)}<span class="kv-pct">${pct}%</span></span>
+          </div>
+        `;
+      })
+      .join('');
+
+    const subagentHtml =
+      active.subagents && active.subagents.count > 0
+        ? `
+          <div class="subagent-strip num">
+            <span>关联子代理 (${active.subagents.count} 会话 · ${active.subagents.turnsCount} 轮)</span>
+            <span class="kv-val">额外 ${fmtTokens(active.subagents.totalTokens)} tok</span>
+          </div>
+        `
+        : '';
+
+    const turnsOpenAttr = state.openFolds.has('turns') ? 'open' : '';
+    const turnsRowsHtml = (active.recentTurns || [])
+      .map((t) => {
+        const speedPart = t.tps > 0 ? `${fmtTps(t.tps)} · ` : '';
+        const turnHitPct = calcCacheHitPct(t.inputTokens, t.cacheReadTokens, t.cacheHitRate);
+        return `
+          <div class="list-item">
+            <div class="list-item-top">
+              <span class="list-item-title" title="${esc(t.modelLabel)}">#${t.idx} · ${esc(t.modelLabel)}</span>
+              <span class="kv-val num">${fmtTokens(t.totalTokens)}</span>
+            </div>
+            <div class="list-item-sub num">
+              <span>未命中 ${fmtTokens(t.inputTokens)} · 缓存 ${fmtTokens(t.cacheReadTokens)} (命中${turnHitPct}%) · 输出 ${fmtTokens(t.outputTokens)}</span>
+              <span>${esc(speedPart)}TTFT ${fmtSec(t.ttftSec)} / ${fmtSec(t.latencySec)}</span>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+
+    const compactionsOpenAttr = state.openFolds.has('compactions') ? 'open' : '';
+    const compactionsFoldHtml =
+      active.compactionEvents?.length > 0
+        ? `
+          <details class="inline-fold" data-fold-id="compactions" ${compactionsOpenAttr}>
+            <summary>上下文压缩 / 回落记录（${active.compactionEvents.length} 次）</summary>
+            <div class="list-stack">
+              ${active.compactionEvents
+                .slice(-4)
+                .reverse()
+                .map(
+                  (ev) => `
+                  <div class="list-item">
+                    <div class="list-item-top">
+                      <span class="list-item-title">Turn #${ev.turnIdx} 窗口收缩</span>
+                      <span class="metric-note num">-${fmtTokens(ev.savedTokens)}</span>
+                    </div>
+                    <div class="list-item-sub num">
+                      <span>${fmtTokens(ev.beforeTokens)} → ${fmtTokens(ev.afterTokens)}</span>
+                      <span>${fmtRelativeTime(ev.timestampMs)}</span>
+                    </div>
+                  </div>`
+                )
+                .join('')}
+            </div>
+          </details>
+        `
+        : '';
+
+    ctxCardHtml = `
+      <section class="card">
+        <div class="card-head">
+          <div class="card-title-group">
+            <span class="card-title">当前上下文</span>
+            <span class="badge-pill" title="${esc(active.modelLabel)}">${esc(active.modelLabel)}</span>
+          </div>
+          <span class="${statusBadgeCls} num">${esc(statusBadgeText)}</span>
+        </div>
+
+        <div class="ctx-summary-row">
+          <div class="ctx-numbers">
+            <div class="metric-big num">${fmtExact(active.contextUsed)} <span class="metric-sub">/ ${fmtExact(active.contextLimit)} tok (${active.contextPct}% · 剩余 ${fmtTokens(remaining)})</span></div>
+          </div>
+        </div>
+
+        <div class="ctx-meter-track" role="progressbar" aria-valuenow="${Math.round(clampedPct)}" aria-valuemin="0" aria-valuemax="100" aria-label="上下文窗口占用百分比">
+          <div class="${meterFillCls}" style="width:${clampedPct.toFixed(1)}%"></div>
+          <span class="ctx-tick" style="left:75%" title="75% 预警线"></span>
+          <span class="ctx-tick" style="left:90%" title="90% 压缩线"></span>
+        </div>
+        ${compactNoticeHtml}
+
+        <div class="section-divider"></div>
+
+        <div class="comp-head">
+          <span>会话累计 Token 构成 · <strong class="strip-ok num">缓存命中 ${active.cacheHitRate}%</strong></span>
+          <span class="kv-val num">${fmtExact(active.totalTokens)} tok</span>
+        </div>
+        <div class="progress-track" aria-hidden="true">${segsHtml}</div>
+        <div class="comp-grid">${compGridHtml}</div>
+        ${subagentHtml}
+
+        <details class="inline-fold" data-fold-id="turns" ${turnsOpenAttr}>
+          <summary>最近生成轮次明细（${active.recentTurns?.length || 0} 轮）</summary>
+          <div class="list-stack">${turnsRowsHtml || '<div class="empty-state">暂无生成轮次</div>'}</div>
+        </details>
+        ${compactionsFoldHtml}
+      </section>
+    `;
+  } else {
+    ctxCardHtml = `
       <section class="card">
         <div class="card-head"><span class="card-title">当前上下文</span></div>
-        <div class="empty-state">当前过滤下暂无会话</div>
+        <div class="empty-state">当前过滤条件下暂无会话记录</div>
       </section>
     `;
+  }
 
-  const mini5hBars = r5.buckets
+  // 2. Quota & Window Consumption Card (5h Rolling + Calendar Week + Per-Pool Ledger)
+  const max5hBar = Math.max(1, ...(r5.buckets || []).map((b) => b.totalTokens || 0));
+  const bars5hHtml = (r5.buckets || [])
     .map((b) => {
-      const h = b.totalTokens > 0 ? Math.max(12, Math.round((b.totalTokens / max5h) * 100)) : 8;
+      const hPct = b.totalTokens > 0 ? Math.max(12, Math.round((b.totalTokens / max5hBar) * 100)) : 4;
+      const bHitPct = calcCacheHitPct(b.inputTokens, b.cacheReadTokens, b.cacheHitRate);
       return `
-        <div class="mini-col" title="${esc(b.label)}: ${fmtTokens(b.totalTokens)} tokens (${b.turnsCount} 轮)">
-          <span class="mini-bar-fill ${b.totalTokens === 0 ? 'empty' : ''}" style="height:${h}%"></span>
+        <div class="mini-col" title="${esc(b.label)}：${fmtTokens(b.totalTokens)} tok (${b.turnsCount} 轮 · 缓存 ${bHitPct}%)">
+          <div class="mini-bar-track">
+            <span class="mini-bar-fill ${b.totalTokens === 0 ? 'empty' : ''}" style="height:${hPct}%"></span>
+          </div>
+          <span class="mini-bar-lbl num">${esc(b.label)}</span>
         </div>
       `;
     })
     .join('');
 
-  const paceCardHtml = `
-    <section class="card">
-      <div class="card-head">
-        <span class="card-title">近 5h 滚动窗口</span>
-        <span class="card-meta accent num">${r5.turnsCount} 轮</span>
-      </div>
-      <div class="metric-main num">${fmtTokens(r5.totalTokens)} tokens</div>
-      <div class="metric-sub num">均速 ${fmtTokens(r5.tokensPerHour)} / h</div>
-      <div class="mini-bars">${mini5hBars}</div>
-      <button type="button" class="link-btn" data-goto-tab="pace">查看 5h 节奏 →</button>
-    </section>
-  `;
-
-  const kpiRowHtml = `
-    <div class="grid-3">
-      <section class="card">
-        <span class="card-title">今日处理量</span>
-        <div class="metric-big num">${fmtTokens(today.totalTokens)}</div>
-        <span class="metric-note num">${today.sessionsCount} 会话 · ${today.turnsCount} 轮</span>
-      </section>
-      <section class="card">
-        <span class="card-title">缓存命中率</span>
-        <div class="metric-big num">${today.cacheHitRate}%</div>
-        <span class="metric-note num">命中 ${fmtTokens(today.cacheReadTokens)}</span>
-      </section>
-      <section class="card">
-        <span class="card-title">平均 TTFT</span>
-        <div class="metric-big num">${fmtSec(today.avgTtftSec)}</div>
-        <span class="metric-sub num">总耗时 ${fmtSec(today.avgLatencySec)}</span>
-      </section>
-    </div>
-  `;
-
-  const chart7dHtml = `
-    <section class="card">
-      <div class="card-head">
-        <div>
-          <span class="card-title">近 7 天 Antigravity 消耗</span>
-          <div class="metric-sub num">共 ${fmtTokens(snap.weekSummary.totalTokens)} tokens · 纯本地统计</div>
-        </div>
-        <button type="button" class="link-btn" data-goto-tab="trends">详细钻取 →</button>
-      </div>
-      <div class="chart-wrap">
-        ${buildStackedChart(snap.mini7d)}
-        <div class="legend-row">
-          <span class="legend-item"><span class="swatch swatch-gemini4"></span>Gemini 4</span>
-          <span class="legend-item"><span class="swatch swatch-claude"></span>Claude</span>
-          <span class="legend-item"><span class="swatch swatch-flash"></span>Flash / Subagent</span>
-        </div>
-      </div>
-    </section>
-  `;
-
-  root.innerHTML = `<div class="grid-2">${ctxCardHtml}${paceCardHtml}</div>${kpiRowHtml}${chart7dHtml}`;
-}
-
-function renderContext() {
-  const root = document.getElementById('body-context');
-  const snap = state.snapshot;
-  const active = snap?.activeSession;
-  if (!active) {
-    root.innerHTML = '<div class="card empty-state">暂无可检查的 Antigravity 会话记录。</div>';
-    return;
-  }
-
-  const sessionOptions = (snap.recentSessions || [])
-    .map((s) => {
-      const label = `${s.surface === 'cli' ? '[CLI] ' : ''}${maskText(s.title, '会话')} (${s.contextPct}%)`;
-      const selected = s.id === active.id ? 'selected' : '';
-      return `<option value="${esc(s.id)}" ${selected}>${esc(label)}</option>`;
-    })
-    .join('');
-
-  const remaining = Math.max(0, active.contextLimit - active.contextUsed);
-  const totalComposed = Math.max(
-    1,
-    active.inputTokens + active.cacheReadTokens + active.thinkingTokens + active.textTokens
-  );
-  const pctIn = (active.inputTokens / totalComposed) * 100;
-  const pctCache = (active.cacheReadTokens / totalComposed) * 100;
-  const pctThink = (active.thinkingTokens / totalComposed) * 100;
-  const pctText = (active.textTokens / totalComposed) * 100;
-
-  let alertBanner = '';
-  if (active.alertLevel === 'danger') {
-    alertBanner = `<span>上下文已达 <strong>${active.contextPct}%</strong>，建议立即发送 <code>/compact</code> 释放空间。</span>`;
-  } else if (active.alertLevel === 'warn') {
-    alertBanner = `<span>上下文已使用 <strong>${active.contextPct}%</strong>，接近高水位阈值。</span>`;
-  } else {
-    alertBanner = `<span>上下文余量充足（剩余 ${fmtTokens(remaining)} tokens）。</span>`;
-  }
-
-  const compactBtnHtml = state.canSendMessage
-    ? `<button type="button" id="btn-compact" class="primary-btn" ${state.compactState === 'sending' ? 'disabled' : ''}>
-         ${state.compactState === 'sending' ? '发送中…' : '一键 /compact'}
-       </button>`
-    : `<span class="metric-sub">侧边栏对话内可用 /compact</span>`;
-
-  const compactFeedbackHtml = state.compactMessage
-    ? `<div class="metric-sub" style="color: ${state.compactState === 'error' ? 'var(--danger)' : 'var(--ok)'}">${esc(state.compactMessage)}</div>`
-    : '';
-
-  const compactionsHtml =
-    active.compactionEvents?.length > 0
+  const rolloff = r5.rolloff;
+  const rolloffTextHtml =
+    rolloff && rolloff.active && rolloff.nextRolloffAtMs > nowMs
       ? `
-      <section class="card">
-        <div class="card-head">
-          <span class="card-title">观测到的上下文回落 / 压缩</span>
-          <span class="card-meta num">${active.compactionEvents.length} 次</span>
+        <div class="rolloff-row num">
+          <span>5h 窗口回血：<strong class="rolloff-tag">${fmtCountdownMs(rolloff.nextRolloffAtMs - nowMs)}</strong> 后滑出最早一批 <strong>${fmtTokens(rolloff.nextRolloffTokens)}</strong></span>
+          <span class="metric-sub">全清需 ${fmtCountdownMs(rolloff.fullClearAtMs - nowMs)}</span>
         </div>
-        <div class="list-stack">
-          ${active.compactionEvents
-            .slice(-3)
-            .reverse()
-            .map(
-              (ev) => `
-              <div class="list-item">
-                <div class="list-item-top">
-                  <span class="list-item-title">Turn #${ev.turnIdx} 窗口收缩</span>
-                  <span class="metric-note num">-${fmtTokens(ev.savedTokens)}</span>
-                </div>
-                <div class="list-item-sub num">
-                  <span>${fmtTokens(ev.beforeTokens)} → ${fmtTokens(ev.afterTokens)}</span>
-                  <span>${fmtRelativeTime(ev.timestampMs)}</span>
-                </div>
-              </div>`
-            )
-            .join('')}
+      `
+      : `
+        <div class="rolloff-row">
+          <span class="metric-note">近 5 小时窗口无消耗（全池空闲）</span>
+          <span class="metric-sub">仅统计本地真实账本</span>
         </div>
-      </section>`
-      : '';
+      `;
 
-  const turnsHtml = (active.recentTurns || [])
-    .map(
-      (t) => `
-      <div class="list-item">
-        <div class="list-item-top">
-          <span class="list-item-title" title="${esc(t.modelLabel)}">#${t.idx} · ${esc(t.modelLabel)}</span>
-          <span class="kv-val num">${fmtTokens(t.totalTokens)}</span>
-        </div>
-        <div class="list-item-sub num">
-          <span>In ${fmtTokens(t.inputTokens)} · Cache ${fmtTokens(t.cacheReadTokens)} · Think ${fmtTokens(t.thinkingTokens)} · Text ${fmtTokens(t.textTokens)}</span>
-          <span>TTFT ${fmtSec(t.ttftSec)} / ${fmtSec(t.latencySec)}</span>
-        </div>
-      </div>`
-    )
-    .join('');
+  const poolRowsHtml = pools
+    .map((p) => {
+      const pRoll = p.rolloff5h;
+      const sub5h =
+        p.tokens5h > 0 && pRoll?.active && pRoll.nextRolloffAtMs > nowMs
+          ? `${fmtCountdownMs(pRoll.nextRolloffAtMs - nowMs)} 后退 ${fmtTokens(pRoll.nextRolloffTokens)}`
+          : p.turns5h > 0
+            ? `${p.turns5h} 轮`
+            : '5h 空闲';
+      const subWeek =
+        p.turnsWeek > 0
+          ? `${p.turnsWeek} 轮 · 缓存 ${p.cacheHitWeek ?? 0}%`
+          : '本周无消耗';
 
-  root.innerHTML = `
-    <section class="card">
-      <div class="card-head">
-        <label class="card-title" for="session-select">目标会话</label>
-        <span class="metric-sub">${esc(maskText(active.project, '已隐藏项目'))}</span>
-      </div>
-      <select id="session-select" class="select-control">${sessionOptions}</select>
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <span class="card-title">Context Window 占用</span>
-        <span class="card-meta ${active.alertLevel} num">${active.turnsCount} 轮 · 缓存 ${active.cacheHitRate}%</span>
-      </div>
-      <div class="ring-row">
-        ${buildRingSvg(active.contextPct, active.alertLevel, 'lg')}
-        <div style="min-width:0; flex:1">
-          <div class="metric-big num">${fmtExact(active.contextUsed)}</div>
-          <div class="metric-sub num">上限 ${fmtExact(active.contextLimit)} · 剩余 ${fmtExact(remaining)}</div>
-          <div class="metric-sub" style="margin-top:2px">${esc(active.modelLabel)}</div>
-        </div>
-      </div>
-      <div class="alert-banner ${active.alertLevel}">
-        <div style="min-width:0">${alertBanner}</div>
-        ${compactBtnHtml}
-      </div>
-      ${compactFeedbackHtml}
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <span class="card-title">会话累计 Token 构成</span>
-        <span class="card-meta num">${fmtTokens(active.totalTokens)}</span>
-      </div>
-      <div class="progress-track" aria-hidden="true">
-        <span class="progress-seg" style="width:${pctCache.toFixed(1)}%; background: var(--ok)"></span>
-        <span class="progress-seg" style="width:${pctIn.toFixed(1)}%; background: var(--accent)"></span>
-        <span class="progress-seg" style="width:${pctThink.toFixed(1)}%; background: var(--warn)"></span>
-        <span class="progress-seg" style="width:${pctText.toFixed(1)}%; background: var(--fg-muted)"></span>
-      </div>
-      <div class="kv-list">
-        <div class="kv-row"><span class="kv-name"><span class="swatch" style="background:var(--ok)"></span>缓存命中 (Cache Read)</span><span class="kv-val num">${fmtExact(active.cacheReadTokens)}</span></div>
-        <div class="kv-row"><span class="kv-name"><span class="swatch" style="background:var(--accent)"></span>未命中输入 (Input)</span><span class="kv-val num">${fmtExact(active.inputTokens)}</span></div>
-        <div class="kv-row"><span class="kv-name"><span class="swatch" style="background:var(--warn)"></span>思考推理 (Thinking)</span><span class="kv-val num">${fmtExact(active.thinkingTokens)}</span></div>
-        <div class="kv-row"><span class="kv-name"><span class="swatch" style="background:var(--fg-muted)"></span>可见输出 (Text)</span><span class="kv-val num">${fmtExact(active.textTokens)}</span></div>
-      </div>
-    </section>
-
-    ${compactionsHtml}
-
-    <section class="card">
-      <div class="card-head">
-        <span class="card-title">最近轮次明细</span>
-        <span class="metric-sub">倒序最近 8 轮</span>
-      </div>
-      <div class="list-stack">${turnsHtml || '<div class="empty-state">暂无生成轮次</div>'}</div>
-    </section>
-  `;
-}
-
-function renderPace() {
-  const root = document.getElementById('body-pace');
-  const snap = state.snapshot;
-  if (!snap) {
-    root.innerHTML = '<div class="card empty-state">暂无 5h 滚动数据</div>';
-    return;
-  }
-
-  const r5 = snap.rolling5h;
-  const week = snap.weekSummary;
-  const weekTotal = Math.max(1, week.totalTokens);
-
-  const famRows = ['gemini4', 'claude', 'flash', 'other']
-    .map((key) => {
-      const v5 = r5.byFamily?.[key] || 0;
-      const v7 = week.byFamily?.[key] || 0;
-      const pct7 = Math.round((v7 / weekTotal) * 1000) / 10;
       return `
-        <div class="list-item">
-          <div class="list-item-top">
-            <span class="kv-name"><span class="swatch swatch-${key}"></span>${esc(FAMILY_LABELS[key])}</span>
-            <span class="kv-val num">${fmtTokens(v7)} <span class="metric-sub">(${pct7}%)</span></span>
+        <div class="pool-row">
+          <span class="pool-name" title="${esc(p.poolLabel)}">
+            <span class="swatch swatch-${esc(p.key)}"></span>
+            <span>${esc(p.label)}</span>
+          </span>
+          <div class="num">
+            <div class="pool-cell-main">${fmtTokens(p.tokens5h)}</div>
+            <div class="pool-cell-sub">${esc(sub5h)}</div>
           </div>
-          <div class="rank-bar-bg"><div class="rank-bar-fill swatch-${key}" style="width:${pct7}%"></div></div>
-          <div class="list-item-sub num">
-            <span>近 5h: ${fmtTokens(v5)} tokens</span>
-            <span>近 7d 占比 ${pct7}%</span>
+          <div class="num">
+            <div class="pool-cell-main">${fmtTokens(p.tokensWeek)}</div>
+            <div class="pool-cell-sub">${esc(subWeek)}</div>
           </div>
         </div>
       `;
     })
     .join('');
 
-  let diagBody = '<div class="metric-sub">展开后读取本地 SQLite 扫描诊断…</div>';
-  if (state.loadingDiagnostics) {
-    diagBody = '<div class="metric-sub">正在检查本地库文件…</div>';
-  } else if (state.diagnostics) {
-    const d = state.diagnostics;
-    diagBody = `
-      <div class="kv-list">
-        <div class="kv-row"><span class="kv-name">内置 Node.js 运行时</span><span class="kv-val mono">${esc(d.nodeVersion)}</span></div>
-        <div class="kv-row"><span class="kv-name">Desktop / CLI 会话库</span><span class="kv-val num">${d.primaryDbCount} + ${d.cliDbCount} (成功 ${d.parsedCount})</span></div>
-        <div class="kv-row"><span class="kv-name">解析耗时 / 错误数</span><span class="kv-val num">${d.scanMs} ms / ${d.errorCount} err</span></div>
-        <div class="kv-row"><span class="kv-name">会话环境变量绑定</span><span class="kv-val">${d.activeEnvConversation ? '已绑定当前对话' : '未绑定（自动取最近活跃）'}</span></div>
-      </div>
-    `;
-  }
+  const weekResetText = `周一重置 · 剩 ${fmtCountdownMs(calWeek.resetAtMs - nowMs)}`;
 
-  root.innerHTML = `
+  const quotaCardHtml = `
     <section class="card">
       <div class="card-head">
-        <div>
-          <span class="card-title">近 5 小时滚动窗口消耗</span>
-          <div class="metric-big num">${fmtTokens(r5.totalTokens)} tokens</div>
+        <div class="card-title-group">
+          <span class="card-title">额度与窗口消耗</span>
         </div>
-        <span class="card-meta accent num">${fmtTokens(r5.tokensPerHour)} / h</span>
+        <span class="badge-pill num" title="自然周统计自本地时间周一 00:00 起">${esc(weekResetText)}</span>
       </div>
-      ${buildStackedChart(r5.buckets, { large: false })}
-      <div class="legend-row">
-        <span>共 ${r5.turnsCount} 轮生成</span>
-        <span>·</span>
-        <span>不含外部接口探测（完全只读本地库）</span>
+
+      <div class="window-kpis">
+        <div class="kpi-tile">
+          <span class="kpi-label">近 5h 已用</span>
+          <span class="kpi-val num">${fmtTokens(r5.totalTokens)}</span>
+          <span class="kpi-sub num">缓存 ${r5.cacheHitRate ?? 0}% · ${fmtTokens(r5.tokensPerHour)}/h</span>
+        </div>
+        <div class="kpi-tile">
+          <span class="kpi-label">本周已用</span>
+          <span class="kpi-val num">${fmtTokens(calWeek.totalTokens)}</span>
+          <span class="kpi-sub num">缓存 ${calWeek.cacheHitRate ?? 0}% · ${calWeek.turnsCount} 轮</span>
+        </div>
+        <div class="kpi-tile">
+          <span class="kpi-label">今日已用</span>
+          <span class="kpi-val num">${fmtTokens(today.totalTokens)}</span>
+          <span class="kpi-sub num">缓存 ${today.cacheHitRate}% · ${fmtSec(today.avgTtftSec)}</span>
+        </div>
+      </div>
+
+      <div class="rolloff-box">
+        ${rolloffTextHtml}
+        <div class="mini-5h-bars">${bars5hHtml}</div>
+      </div>
+
+      <div class="pool-ledger">
+        <div class="pool-head">
+          <span>独立模型池</span>
+          <span>近 5h 已用 / 回血</span>
+          <span>本周累计</span>
+        </div>
+        ${poolRowsHtml}
       </div>
     </section>
-
-    <section class="card">
-      <div class="card-head">
-        <span class="card-title">7 天模型家族消耗分布</span>
-        <span class="card-meta num">${fmtTokens(week.totalTokens)}</span>
-      </div>
-      <div class="list-stack">${famRows}</div>
-    </section>
-
-    <details id="diag-disclosure" class="diag-box" ${state.diagnostics ? 'open' : ''}>
-      <summary>本地数据源与解析诊断</summary>
-      <div id="diag-content">${diagBody}</div>
-    </details>
   `;
+
+  root.innerHTML = `${stripHtml}<div class="live-grid">${ctxCardHtml}${quotaCardHtml}</div>`;
 }
 
 function renderTrends() {
   const root = document.getElementById('body-trends');
   if (state.loadingAnalytics && !state.analytics) {
-    root.innerHTML = '<div class="card empty-state">正在聚合多日消费明细…</div>';
+    root.innerHTML = '<div class="card empty-state">正在聚合多日消耗明细…</div>';
     return;
   }
 
   const data = state.analytics;
   if (!data) {
-    root.innerHTML = '<div class="card empty-state">切换至此标签页自动加载分析数据</div>';
+    root.innerHTML = '<div class="card empty-state">切换至此视图自动加载多日趋势分析</div>';
     return;
   }
 
@@ -556,9 +637,9 @@ function renderTrends() {
 
   const legendFilters = ['all', 'gemini4', 'claude', 'flash']
     .map((f) => {
-      const label = f === 'all' ? '全部家族' : FAMILY_LABELS[f];
+      const label = f === 'all' ? '全部模型' : FAMILY_LABELS[f];
       const dot = f === 'all' ? '' : `<span class="swatch swatch-${f}"></span>`;
-      return `<button type="button" class="legend-item interactive" data-family="${f}" aria-pressed="${state.analyticsFamily === f}">${dot}${esc(label)}</button>`;
+      return `<button type="button" class="legend-item" data-family="${f}" aria-pressed="${state.analyticsFamily === f}">${dot}${esc(label)}</button>`;
     })
     .join('');
 
@@ -567,8 +648,11 @@ function renderTrends() {
       ? data.daily[state.selectedChartDayIdx]
       : data.daily[data.daily.length - 1];
 
+  const selectedDayHitPct = selectedDay
+    ? calcCacheHitPct(selectedDay.inputTokens, selectedDay.cacheReadTokens, selectedDay.cacheHitRate)
+    : 0;
   const selectedDayInfo = selectedDay
-    ? `${selectedDay.dateLabel}：${fmtTokens(selectedDay.totalTokens)} tokens · ${selectedDay.turnsCount} 轮`
+    ? `${selectedDay.dateLabel}：${fmtTokens(selectedDay.totalTokens)} tok（未命中 ${fmtTokens(selectedDay.inputTokens)} · 缓存 ${fmtTokens(selectedDay.cacheReadTokens)} (命中${selectedDayHitPct}%) · 输出 ${fmtTokens(selectedDay.outputTokens)} · ${selectedDay.turnsCount} 轮）`
     : '';
 
   const drillButtons = [
@@ -601,7 +685,7 @@ function renderTrends() {
 
             const leftSub =
               state.drillMode === 'model'
-                ? `${item.turnsCount} 轮 · Think ${fmtTokens(item.thinkingTokens)}`
+                ? `${item.turnsCount} 轮${item.avgTps > 0 ? ` · ${fmtTps(item.avgTps)}` : ''} · 思考 ${fmtTokens(item.thinkingTokens)}`
                 : state.drillMode === 'project'
                   ? `${item.sessionsCount} 会话 · ${item.turnsCount} 轮`
                   : `${maskText(item.project, '项目')} · ${item.modelLabel}`;
@@ -615,54 +699,99 @@ function renderTrends() {
                 <div class="rank-bar-bg"><div class="rank-bar-fill" style="width:${pct}%"></div></div>
                 <div class="list-item-sub num">
                   <span>${esc(leftSub)}</span>
-                  <span>缓存 ${item.cacheHitRate}%</span>
+                  <span>缓存 ${fmtTokens(item.cacheReadTokens || 0)} (命中${item.cacheHitRate}%)</span>
                 </div>
               </div>
             `;
           })
           .join('')
-      : '<div class="empty-state">当前筛选范围内无消费明细</div>';
+      : '<div class="empty-state">当前筛选范围内无消耗记录</div>';
+
+  let diagBody = '<div class="metric-sub">展开后读取本地 SQLite 扫描诊断…</div>';
+  if (state.loadingDiagnostics) {
+    diagBody = '<div class="metric-sub">正在检查本地库文件…</div>';
+  } else if (state.diagnostics) {
+    const d = state.diagnostics;
+    diagBody = `
+      <div class="kv-list">
+        <div class="kv-row"><span class="kv-name">内置 Node.js 运行时</span><span class="kv-val mono">${esc(d.nodeVersion)}</span></div>
+        <div class="kv-row"><span class="kv-name">Desktop / CLI 会话库</span><span class="kv-val num">${d.primaryDbCount} + ${d.cliDbCount} (已解析 ${d.parsedCount})</span></div>
+        <div class="kv-row"><span class="kv-name">扫描耗时 / 异常数</span><span class="kv-val num">${d.scanMs} ms / ${d.errorCount} err</span></div>
+        <div class="kv-row"><span class="kv-name">当前对话环境变量</span><span class="kv-val">${d.activeEnvConversation ? '已自动锁定当前对话' : '未注入（自动选最近活跃会话）'}</span></div>
+      </div>
+    `;
+  }
+
+  const diagOpenAttr = state.openFolds.has('diag') ? 'open' : '';
 
   root.innerHTML = `
-    <section class="card">
-      <div class="card-head">
-        <div>
-          <span class="card-title">${data.days} 天消费趋势</span>
-          <div class="metric-main num">${fmtTokens(data.totals.totalTokens)} tokens</div>
+    <div class="trends-grid">
+      <section class="card">
+        <div class="card-head">
+          <div>
+            <span class="card-title">近 ${data.days} 天消耗趋势${state.loadingAnalytics ? ' · 更新中…' : ''}</span>
+            <div class="metric-main num">${fmtTokens(data.totals.totalTokens)} tok <span class="metric-sub">· 缓存 ${data.totals.cacheHitRate}% · TTFT ${fmtSec(data.totals.avgTtftSec)}</span></div>
+          </div>
+          <div class="sub-pills" role="group" aria-label="统计天数">${dayButtons}</div>
         </div>
-        <div class="sub-pills" role="group" aria-label="统计天数">${dayButtons}</div>
-      </div>
 
-      ${buildStackedChart(data.daily, {
-        large: true,
-        selectedIdx: state.selectedChartDayIdx,
-        familyFilter: state.analyticsFamily,
-        clickable: true,
-      })}
+        <div class="chart-wrap">
+          ${buildStackedChart(data.daily, {
+            selectedIdx: state.selectedChartDayIdx,
+            familyFilter: state.analyticsFamily,
+            clickable: true,
+          })}
+          <div class="legend-row">${legendFilters}</div>
+          <div class="metric-sub num">${esc(selectedDayInfo)}</div>
+        </div>
+      </section>
 
-      <div class="legend-row">${legendFilters}</div>
-      <div class="metric-sub num">${esc(selectedDayInfo)} · 缓存命中 ${data.totals.cacheHitRate}% · 平均 TTFT ${fmtSec(data.totals.avgTtftSec)}</div>
-    </section>
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title">消耗排行</span>
+          <div class="sub-pills" role="group" aria-label="排行维度">${drillButtons}</div>
+        </div>
+        <div class="list-stack">${drillHtml}</div>
+      </section>
+    </div>
 
-    <section class="card">
-      <div class="card-head">
-        <span class="card-title">消费钻取</span>
-        <div class="sub-pills" role="group" aria-label="钻取维度">${drillButtons}</div>
-      </div>
-      <div class="list-stack">${drillHtml}</div>
-    </section>
+    <details id="diag-disclosure" class="diag-box" data-fold-id="diag" ${diagOpenAttr}>
+      <summary>本地数据源与解析诊断（纯本地只读 SQLite · 零额外模型 Token）</summary>
+      <div id="diag-content">${diagBody}</div>
+    </details>
   `;
 }
 
-function renderAll() {
-  renderHeaderAndFilters();
-  renderOverview();
-  renderContext();
-  renderPace();
-  renderTrends();
+function computeSnapshotFingerprint(snap) {
+  if (!snap) return '';
+  const a = snap.activeSession;
+  return [
+    snap.surface,
+    a?.id || '',
+    a?.turnsCount || 0,
+    a?.stepCount || 0,
+    a?.totalTokens || 0,
+    a?.contextUsed || 0,
+    snap.today?.totalTokens || 0,
+    snap.rolling5h?.totalTokens || 0,
+    snap.calendarWeek?.totalTokens || 0,
+  ].join('|');
 }
 
-function selectTab(tabName, { focusTab = false } = {}) {
+let lastRenderedFingerprint = '';
+let snapshotReqSeq = 0;
+let analyticsReqSeq = 0;
+let isPointerDown = false;
+
+function renderAll() {
+  renderTopToolbar();
+  renderLive();
+  renderTrends();
+  lastRenderedFingerprint = computeSnapshotFingerprint(state.snapshot);
+}
+
+function selectTab(rawTabName, { focusTab = false } = {}) {
+  const tabName = normalizeTabName(rawTabName);
   if (!TAB_ORDER.includes(tabName)) return;
   state.activeTab = tabName;
 
@@ -670,7 +799,10 @@ function selectTab(tabName, { focusTab = false } = {}) {
     const isSel = tabEl.dataset.tab === tabName;
     tabEl.setAttribute('aria-selected', String(isSel));
     tabEl.setAttribute('tabindex', isSel ? '0' : '-1');
-    if (isSel && focusTab) tabEl.focus();
+    if (isSel) {
+      tabEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      if (focusTab) tabEl.focus();
+    }
   });
 
   TAB_ORDER.forEach((name) => {
@@ -683,62 +815,85 @@ function selectTab(tabName, { focusTab = false } = {}) {
   }
 }
 
-const app = new App({ name: 'Token Pulse', version: '1.0.0' }, {});
+const app = new App({ name: 'Token Pulse', version: '1.1.0' }, {});
 
-async function loadSnapshot() {
-  if (state.loadingSnapshot) return;
+async function loadSnapshot({ background = false } = {}) {
+  if (background && (state.loadingSnapshot || isPointerDown)) return;
+  const reqId = ++snapshotReqSeq;
   state.loadingSnapshot = true;
   const refreshBtn = document.getElementById('btn-refresh');
-  refreshBtn?.classList.add('spinning');
+  if (!background) refreshBtn?.classList.add('spinning');
+
+  const reqSurface = state.surface;
+  const reqSessionId = state.selectedSessionId;
+
   try {
     const res = await app.callServerTool({
       name: 'telemetry_snapshot',
       arguments: {
-        surface: state.surface,
-        ...(state.selectedSessionId ? { conversationId: state.selectedSessionId } : {}),
+        surface: reqSurface,
+        ...(reqSessionId ? { conversationId: reqSessionId } : {}),
       },
     });
+    if (reqId !== snapshotReqSeq) return;
     if (res?.isError) {
       state.errorText = res.content?.[0]?.text || '读取快照失败';
+      renderAll();
     } else if (res?.structuredContent) {
       state.errorText = '';
+      const nextFp = computeSnapshotFingerprint(res.structuredContent);
       state.snapshot = res.structuredContent;
+      if (background && nextFp === lastRenderedFingerprint) {
+        renderTopToolbar();
+      } else {
+        renderAll();
+      }
     }
   } catch (err) {
+    if (reqId !== snapshotReqSeq) return;
     state.errorText = err instanceof Error ? err.message : String(err);
-  } finally {
-    state.loadingSnapshot = false;
-    refreshBtn?.classList.remove('spinning');
     renderAll();
+  } finally {
+    if (reqId === snapshotReqSeq) {
+      state.loadingSnapshot = false;
+      refreshBtn?.classList.remove('spinning');
+    }
   }
 }
 
 async function loadAnalytics() {
-  if (state.loadingAnalytics) return;
+  const reqId = ++analyticsReqSeq;
+  const reqSurface = state.surface;
+  const reqDays = state.analyticsDays;
+  const reqFamily = state.analyticsFamily;
+
   state.loadingAnalytics = true;
   renderTrends();
   try {
     const res = await app.callServerTool({
       name: 'telemetry_analytics',
       arguments: {
-        surface: state.surface,
-        days: state.analyticsDays,
-        family: state.analyticsFamily,
+        surface: reqSurface,
+        days: reqDays,
+        family: reqFamily,
       },
     });
+    if (reqId !== analyticsReqSeq) return;
     if (!res?.isError && res?.structuredContent) {
       state.analytics = res.structuredContent;
     }
   } finally {
-    state.loadingAnalytics = false;
-    renderTrends();
+    if (reqId === analyticsReqSeq) {
+      state.loadingAnalytics = false;
+      renderTrends();
+    }
   }
 }
 
 async function loadDiagnostics() {
   if (state.loadingDiagnostics) return;
   state.loadingDiagnostics = true;
-  renderPace();
+  renderTrends();
   try {
     const res = await app.callServerTool({
       name: 'telemetry_diagnostics',
@@ -749,39 +904,14 @@ async function loadDiagnostics() {
     }
   } finally {
     state.loadingDiagnostics = false;
-    renderPace();
-  }
-}
-
-async function handleSendCompact() {
-  if (!state.canSendMessage || state.compactState === 'sending') return;
-  state.compactState = 'sending';
-  state.compactMessage = '';
-  renderContext();
-  try {
-    const res = await app.sendMessage({
-      role: 'user',
-      content: [{ type: 'text', text: '/compact' }],
-    });
-    if (res?.isError) {
-      state.compactState = 'error';
-      state.compactMessage = '宿主拒绝了 /compact 消息发送';
-    } else {
-      state.compactState = 'sent';
-      state.compactMessage = '已向当前对话发送 /compact';
-    }
-  } catch (err) {
-    state.compactState = 'error';
-    state.compactMessage = err instanceof Error ? err.message : '发送失败';
-  } finally {
-    renderContext();
+    renderTrends();
   }
 }
 
 // Register MCP Apps handlers BEFORE calling app.connect()
 app.ontoolinput = () => {
   if (!state.snapshot) {
-    renderHeaderAndFilters();
+    renderTopToolbar();
   }
 };
 
@@ -791,7 +921,7 @@ app.ontoolresult = (result) => {
   if (sc.snapshot) {
     state.snapshot = sc.snapshot;
     state.errorText = '';
-    if (sc.initialTab && TAB_ORDER.includes(sc.initialTab)) {
+    if (sc.initialTab) {
       selectTab(sc.initialTab);
     }
   } else if (sc.today) {
@@ -805,13 +935,24 @@ app.onhostcontextchanged = (ctx) => {
   applyHostThemeContext(ctx);
 };
 
+document.addEventListener('pointerdown', () => {
+  isPointerDown = true;
+});
+document.addEventListener('pointerup', () => {
+  isPointerDown = false;
+});
+document.addEventListener('pointercancel', () => {
+  isPointerDown = false;
+});
+
 // Event delegation for UI controls
 document.addEventListener('click', (event) => {
-  const target = event.target.closest('button');
+  const origin = event.target instanceof Element ? event.target : event.target?.parentElement;
+  const target = origin?.closest('button');
   if (!target) return;
 
   if (target.id === 'btn-refresh') {
-    void loadSnapshot();
+    void loadSnapshot({ background: false });
     if (state.activeTab === 'trends') void loadAnalytics();
     return;
   }
@@ -822,18 +963,13 @@ document.addEventListener('click', (event) => {
     return;
   }
 
-  if (target.id === 'btn-compact') {
-    void handleSendCompact();
-    return;
-  }
-
   if (target.dataset.surface) {
     const nextSurface = target.dataset.surface;
     if (nextSurface !== state.surface) {
       state.surface = nextSurface;
       state.selectedSessionId = null;
       state.analytics = null;
-      void loadSnapshot();
+      void loadSnapshot({ background: false });
       if (state.activeTab === 'trends') void loadAnalytics();
     }
     return;
@@ -841,11 +977,6 @@ document.addEventListener('click', (event) => {
 
   if (target.dataset.tab) {
     selectTab(target.dataset.tab);
-    return;
-  }
-
-  if (target.dataset.gotoTab) {
-    selectTab(target.dataset.gotoTab);
     return;
   }
 
@@ -881,19 +1012,29 @@ document.addEventListener('click', (event) => {
 document.addEventListener('change', (event) => {
   if (event.target?.id === 'session-select') {
     state.selectedSessionId = event.target.value || null;
-    state.compactState = 'idle';
-    state.compactMessage = '';
-    void loadSnapshot();
+    void loadSnapshot({ background: false });
   }
 });
 
-document.addEventListener('toggle', (event) => {
-  if (event.target?.id === 'diag-disclosure' && event.target.open && !state.diagnostics) {
-    void loadDiagnostics();
-  }
-}, true);
+// Preserve <details> open states across periodic refreshes & lazy-load diagnostics
+document.addEventListener(
+  'toggle',
+  (event) => {
+    const el = event.target;
+    if (!(el instanceof HTMLDetailsElement)) return;
+    const foldId = el.dataset.foldId;
+    if (foldId) {
+      if (el.open) state.openFolds.add(foldId);
+      else state.openFolds.delete(foldId);
+    }
+    if (el.id === 'diag-disclosure' && el.open && !state.diagnostics) {
+      void loadDiagnostics();
+    }
+  },
+  true
+);
 
-// Keyboard navigation for ARIA tablist
+// Keyboard navigation for ARIA tablist (selection follows focus)
 const tablist = document.querySelector('.segmented-tabs');
 tablist?.addEventListener('keydown', (event) => {
   const currentIdx = TAB_ORDER.indexOf(state.activeTab);
@@ -913,18 +1054,16 @@ async function bootstrap() {
   try {
     await app.connect();
     applyHostThemeContext(app.getHostContext());
-    const caps = app.getHostCapabilities();
-    state.canSendMessage = Boolean(caps?.message);
     if (!state.snapshot) {
-      await loadSnapshot();
+      await loadSnapshot({ background: false });
     } else {
       renderAll();
     }
     setInterval(() => {
       if (document.visibilityState === 'visible') {
-        void loadSnapshot();
+        void loadSnapshot({ background: true });
       }
-    }, 30_000);
+    }, 20_000);
   } catch (err) {
     state.errorText = err instanceof Error ? err.message : String(err);
     renderAll();

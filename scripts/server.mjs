@@ -11,7 +11,7 @@ const APP_URI = 'ui://token-pulse/dashboard';
 const RESOURCE_MIME_TYPE = 'text/html;profile=mcp-app';
 const SERVER_INFO = {
   name: 'token-pulse-telemetry',
-  version: '1.0.0',
+  version: '1.1.0',
 };
 const DEFAULT_PROTOCOL_VERSION = '2025-03-26';
 
@@ -30,6 +30,11 @@ function formatCompactTokens(n) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(Math.round(n));
+}
+
+function normalizeInitialTab(rawTab) {
+  if (rawTab === 'trends') return 'trends';
+  return 'live';
 }
 
 function sendMessage(msg) {
@@ -51,14 +56,14 @@ const TOOLS = [
     name: 'open_telemetry_panel',
     title: 'Token Pulse',
     description:
-      'Open the native Token Pulse telemetry dashboard in the side pane or global view to inspect live Antigravity context usage, cache hit rate, latency, 5h pace, and 7-day analytics.',
+      'Open the native Token Pulse telemetry dashboard in the side pane or global view to inspect live Antigravity context breakdown, generation speed (tok/s), cache hit rate, 5h/weekly model-pool consumption & rolloff countdown, and multi-day trends.',
     inputSchema: {
       type: 'object',
       properties: {
         tab: {
           type: 'string',
-          enum: ['overview', 'context', 'pace', 'trends'],
-          description: 'Initial tab to focus when opening the dashboard.',
+          enum: ['live', 'trends', 'overview', 'context', 'pace'],
+          description: 'Initial view to focus (`live` for real-time context & 5h/weekly quota pools, `trends` for 7d/14d/30d history).',
         },
         surface: {
           type: 'string',
@@ -86,7 +91,7 @@ const TOOLS = [
   {
     name: 'telemetry_snapshot',
     title: 'Fetch live telemetry snapshot',
-    description: 'App-only tool returning current context window usage, today KPIs, and 5h rolling pace.',
+    description: 'App-only tool returning current context breakdown, generation speed, 5h/weekly model-pool usage, and rolloff timers.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -205,14 +210,12 @@ function handleToolsCall(id, params) {
   try {
     if (name === 'open_telemetry_panel') {
       const surface = ['all', 'desktop', 'cli'].includes(args.surface) ? args.surface : 'all';
-      const initialTab = ['overview', 'context', 'pace', 'trends'].includes(args.tab)
-        ? args.tab
-        : 'overview';
+      const initialTab = normalizeInitialTab(args.tab);
       const conversationId = typeof args.conversationId === 'string' ? args.conversationId : null;
       const snapshot = getSnapshot({ surface, conversationId });
       const active = snapshot.activeSession;
       const summaryLine = active
-        ? `Token Pulse ready: ${active.modelLabel} context ${formatCompactTokens(active.contextUsed)}/${formatCompactTokens(active.contextLimit)} (${active.contextPct}%), today cache hit ${snapshot.today.cacheHitRate}%.`
+        ? `Token Pulse ready: ${active.modelLabel} context ${formatCompactTokens(active.contextUsed)}/${formatCompactTokens(active.contextLimit)} (${active.contextPct}%), ${active.turnsCount} turns / ${active.stepCount} steps, cache hit ${active.cacheHitRate}%, 5h ${formatCompactTokens(snapshot.rolling5h.totalTokens)}.`
         : `Token Pulse ready: today ${formatCompactTokens(snapshot.today.totalTokens)} tokens across ${snapshot.today.sessionsCount} sessions.`;
 
       sendResult(id, {

@@ -19,11 +19,14 @@ const MODEL_ENUM_LABELS = {
 };
 
 const FAMILY_META = {
-  gemini4: { key: 'gemini4', label: 'Gemini 4', order: 0 },
-  flash: { key: 'flash', label: 'Flash / Subagent', order: 1 },
-  claude: { key: 'claude', label: 'Claude', order: 2 },
-  other: { key: 'other', label: 'Other', order: 3 },
+  gemini4: { key: 'gemini4', label: 'Gemini 4', poolLabel: 'Gemini 4 主力池', order: 0 },
+  claude: { key: 'claude', label: 'Claude', poolLabel: 'Claude 池', order: 1 },
+  flash: { key: 'flash', label: 'Flash / Subagent', poolLabel: 'Flash / 子代理池', order: 2 },
+  other: { key: 'other', label: 'Other', poolLabel: '其他模型池', order: 3 },
 };
+
+const WINDOW_5H_MS = 5 * 3_600_000;
+const ROLLOFF_BATCH_SPAN_MS = 15 * 60_000;
 
 /**
  * Resolve the user's .gemini root directory.
@@ -151,6 +154,7 @@ function parseGenMetadataBlob(blob) {
     textTokens: 0,
     contextUsed: 0,
     contextLimit: 0,
+    streamSec: 0,
     latencySec: 0,
     ttftSec: 0,
     metaMap: {},
@@ -206,6 +210,7 @@ function parseGenMetadataBlob(blob) {
     });
   });
 
+  out.streamSec = streamSec;
   out.latencySec = out.ttftSec + streamSec;
   if (out.textTokens === 0 && out.outputTokens > 0) {
     out.textTokens = Math.max(0, out.outputTokens - out.thinkingTokens);
@@ -263,15 +268,21 @@ function classifyModelFamily(modelLabel, modelSlug, modelEnum, metaMap) {
   if (text.includes('flash') || modelEnum === 1298 || modelEnum === 1318 || modelEnum === 1322) {
     return 'flash';
   }
-  if (/gemini[- ]?4|neon|hydrogen|argon|orchestrator/i.test(text)) {
+  if (/gemini[- ]?4|neon|carbon|hydrogen|argon|orchestrator/i.test(text)) {
     return 'gemini4';
   }
   return 'other';
 }
 
+function computeTurnTps(outputTokens, streamSec, latencySec) {
+  if (!outputTokens || outputTokens <= 0) return 0;
+  const effectiveSec = streamSec > 0.05 ? streamSec : latencySec > 0.05 ? latencySec : 0;
+  if (effectiveSec <= 0 || effectiveSec > 3600) return 0;
+  return Math.round((outputTokens / effectiveSec) * 10) / 10;
+}
+
 function parseSqlTimestampMs(raw) {
   if (!raw || typeof raw !== 'string') return 0;
-  // Normalize "2026-11-22 20:22:37.7283655+00:00" -> "2026-11-22T20:22:37.728+00:00"
   const normalized = raw
     .trim()
     .replace(' ', 'T')
@@ -320,11 +331,28 @@ function loadSummariesMap(geminiDir) {
     let db;
     try {
       db = openReadOnlyDb(candidate.path);
-      const rows = db
-        .prepare(
-          'SELECT conversation_id, title, last_modified_time, workspace_uris, status, source, project_id FROM conversation_summaries'
-        )
-        .all();
+      const cols = new Set(
+        db
+          .prepare("PRAGMA table_info('conversation_summaries')")
+          .all()
+          .map((c) => String(c.name))
+      );
+
+      const selectCols = [
+        'conversation_id',
+        'title',
+        'last_modified_time',
+        'workspace_uris',
+        'status',
+        'source',
+        'project_id',
+      ];
+      if (cols.has('step_count')) selectCols.push('step_count');
+      if (cols.has('parent_conversation_id')) selectCols.push('parent_conversation_id');
+      if (cols.has('nesting_depth')) selectCols.push('nesting_depth');
+      if (cols.has('agent_name')) selectCols.push('agent_name');
+
+      const rows = db.prepare(`SELECT ${selectCols.join(', ')} FROM conversation_summaries`).all();
       for (const row of rows) {
         if (!row.conversation_id) continue;
         const src = String(row.source || '').toUpperCase();
@@ -336,12 +364,32 @@ function loadSummariesMap(geminiDir) {
           summaries.set(row.conversation_id, {
             id: row.conversation_id,
             title: row.title || prev?.title || '',
+            stepCount: Number(row.step_count) || prev?.stepCount || 0,
+            parentId: row.parent_conversation_id || prev?.parentId || '',
+            nestingDepth: Number(row.nesting_depth) || prev?.nestingDepth || 0,
+            agentName: row.agent_name || prev?.agentName || '',
             lastModifiedMs: modMs || prev?.lastModifiedMs || 0,
             project: extractProjectName(row.workspace_uris, row.project_id),
             workspaceRaw: row.workspace_uris || '',
             status: row.status || '',
             surface,
           });
+        }
+      }
+
+      const hasParentsTable = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_parents'")
+        .get();
+      if (hasParentsTable) {
+        const pRows = db
+          .prepare('SELECT conversation_id, parent_id FROM conversation_parents')
+          .all();
+        for (const pRow of pRows) {
+          if (!pRow.conversation_id || !pRow.parent_id) continue;
+          const existing = summaries.get(pRow.conversation_id);
+          if (existing && !existing.parentId) {
+            existing.parentId = String(pRow.parent_id);
+          }
         }
       }
     } catch {
@@ -382,14 +430,15 @@ function parseConversationDb(dbPath, forcedSurface, summary) {
 
     const stepTimeByIdx = new Map();
     const stepTimeByReqId = new Map();
+    let dbStepCount = 0;
     const hasSteps = db
       .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='steps'")
       .get();
     if (hasSteps) {
-      const stepRows = db
-        .prepare('SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL')
-        .all();
+      const stepRows = db.prepare('SELECT idx, metadata FROM steps').all();
+      dbStepCount = stepRows.length;
       for (const sRow of stepRows) {
+        if (!sRow.metadata) continue;
         try {
           const parsedStep = parseStepMetadataBlob(sRow.metadata);
           if (parsedStep.timestampMs > 0) {
@@ -424,6 +473,7 @@ function parseConversationDb(dbPath, forcedSurface, summary) {
       const family = classifyModelFamily(modelLabel, g.modelSlug, g.modelEnum, g.metaMap);
       const totalTokens =
         g.inputTokens + g.cacheReadTokens + g.cacheWriteTokens + g.outputTokens;
+      const tps = computeTurnTps(g.outputTokens, g.streamSec, g.latencySec);
 
       turns.push({
         idx: Number(gRow.idx),
@@ -440,8 +490,10 @@ function parseConversationDb(dbPath, forcedSurface, summary) {
         totalTokens,
         contextUsed: g.contextUsed,
         contextLimit: g.contextLimit,
+        streamSec: g.streamSec,
         latencySec: g.latencySec,
         ttftSec: g.ttftSec,
+        tps,
         requestId: g.requestId,
       });
     }
@@ -450,6 +502,7 @@ function parseConversationDb(dbPath, forcedSurface, summary) {
       id: convId,
       dbPath,
       mtimeMs: stat.mtimeMs,
+      dbStepCount,
       turns,
     };
     dbParseCache.set(dbPath, { mtimeMs: stat.mtimeMs, size: stat.size, parsed });
@@ -473,12 +526,21 @@ function mergeSummaryIntoParsed(parsed, summary, forcedSurface) {
     summary?.lastModifiedMs || 0,
     parsed.mtimeMs || 0
   );
+  const stepCount = Math.max(
+    summary?.stepCount || 0,
+    parsed.dbStepCount || 0,
+    parsed.turns.length
+  );
   return {
     ...parsed,
     surface: forcedSurface || summary?.surface || 'desktop',
     title: summary?.title || `Session ${parsed.id.slice(0, 8)}`,
     project: summary?.project || 'Outside of Project',
     status: summary?.status || 'CASCADE_RUN_STATUS_IDLE',
+    stepCount,
+    parentId: summary?.parentId || '',
+    nestingDepth: summary?.nestingDepth || 0,
+    agentName: summary?.agentName || '',
     lastActiveMs,
   };
 }
@@ -522,7 +584,6 @@ function scanAllConversations() {
     }
   }
 
-  // Deduplicate by conversationId, preferring primary Antigravity root if both exist
   const byId = new Map();
   let primaryDbCount = 0;
   let cliDbCount = 0;
@@ -582,7 +643,7 @@ function computeCacheHitRate(inputTokens, cacheReadTokens) {
 
 /**
  * Determine the representative context window turn for a session.
- * Prefers the latest turn of the session's primary non-flash-lite model if subagents ran interleaved.
+ * Prefers the latest turn of the session's primary non-flash model if subagents ran interleaved.
  */
 function resolveContextState(turns) {
   const withLimit = turns.filter((t) => t.contextLimit > 0);
@@ -610,7 +671,6 @@ function resolveContextState(turns) {
       : 0;
   const alertLevel = pct >= 90 ? 'danger' : pct >= 75 ? 'warn' : 'ok';
 
-  // Detect real context drops (>35% drop across consecutive main turns)
   const compactionEvents = [];
   for (let i = 1; i < targetPool.length; i += 1) {
     const prev = targetPool[i - 1];
@@ -659,7 +719,12 @@ function buildDailyBuckets(turns, days, nowMs) {
     const d = new Date(todayMidnight.getTime() - i * 86_400_000);
     const key = localDayKey(d.getTime());
     const weekdayNames = ['日', '一', '二', '三', '四', '五', '六'];
-    const shortLabel = i === 0 ? '今' : days <= 7 ? weekdayNames[d.getDay()] : `${d.getMonth() + 1}/${d.getDate()}`;
+    const shortLabel =
+      i === 0
+        ? '今'
+        : days <= 7
+          ? weekdayNames[d.getDay()]
+          : `${d.getMonth() + 1}/${d.getDate()}`;
     const bucket = {
       dayKey: key,
       label: shortLabel,
@@ -689,11 +754,97 @@ function buildDailyBuckets(turns, days, nowMs) {
     b.families[t.family] = (b.families[t.family] || 0) + t.totalTokens;
   }
 
+  for (const b of buckets) {
+    b.cacheHitRate = computeCacheHitRate(b.inputTokens, b.cacheReadTokens);
+  }
+
   return buckets;
 }
 
 /**
- * Get live telemetry snapshot for Overview, Context, and 5h/7d Pace tabs.
+ * Compute 5h rolling window rolloff timing from sorted or unsorted window turns.
+ */
+function compute5hRolloff(windowTurns, nowMs) {
+  if (!windowTurns || windowTurns.length === 0) {
+    return {
+      active: false,
+      nextRolloffAtMs: 0,
+      nextRolloffInSec: 0,
+      nextRolloffTokens: 0,
+      fullClearAtMs: 0,
+      fullClearInSec: 0,
+    };
+  }
+
+  const sorted = [...windowTurns].sort((a, b) => a.timestampMs - b.timestampMs);
+  const firstTs = sorted[0].timestampMs;
+  const lastTs = sorted[sorted.length - 1].timestampMs;
+  const batchEndTs = firstTs + ROLLOFF_BATCH_SPAN_MS;
+
+  let batchTokens = 0;
+  for (const t of sorted) {
+    if (t.timestampMs <= batchEndTs) {
+      batchTokens += t.totalTokens;
+    } else {
+      break;
+    }
+  }
+
+  const nextRolloffAtMs = firstTs + WINDOW_5H_MS;
+  const fullClearAtMs = lastTs + WINDOW_5H_MS;
+
+  return {
+    active: true,
+    nextRolloffAtMs,
+    nextRolloffInSec: Math.max(1, Math.round((nextRolloffAtMs - nowMs) / 1000)),
+    nextRolloffTokens: batchTokens,
+    fullClearAtMs,
+    fullClearInSec: Math.max(1, Math.round((fullClearAtMs - nowMs) / 1000)),
+  };
+}
+
+/**
+ * Collect descendant subagent conversations rooted at `rootId`.
+ */
+function collectDescendantStats(conversations, rootId) {
+  if (!rootId) {
+    return { count: 0, turnsCount: 0, totalTokens: 0 };
+  }
+  const byId = new Map(conversations.map((c) => [c.id, c]));
+  const memo = new Map();
+
+  function descendsFromRoot(convId) {
+    if (memo.has(convId)) return memo.get(convId);
+    memo.set(convId, false); // cycle guard
+    const c = byId.get(convId);
+    if (!c || !c.parentId) return false;
+    if (c.parentId === rootId) {
+      memo.set(convId, true);
+      return true;
+    }
+    const res = descendsFromRoot(c.parentId);
+    memo.set(convId, res);
+    return res;
+  }
+
+  let count = 0;
+  let turnsCount = 0;
+  let totalTokens = 0;
+  for (const c of conversations) {
+    if (c.id === rootId) continue;
+    if (descendsFromRoot(c.id)) {
+      count += 1;
+      turnsCount += c.turns.length;
+      for (const t of c.turns) {
+        totalTokens += t.totalTokens;
+      }
+    }
+  }
+  return { count, turnsCount, totalTokens };
+}
+
+/**
+ * Get live telemetry snapshot for Live and Trends views.
  */
 export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
   const nowMs = Date.now();
@@ -703,14 +854,17 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
   const envConvId = process.env.ANTIGRAVITY_CONVERSATION_ID || null;
   let activeConv = null;
   if (conversationId) {
-    activeConv = filtered.find((c) => c.id === conversationId) || conversations.find((c) => c.id === conversationId);
+    activeConv =
+      filtered.find((c) => c.id === conversationId) ||
+      conversations.find((c) => c.id === conversationId);
   }
   if (!activeConv && envConvId) {
     activeConv = filtered.find((c) => c.id === envConvId);
   }
   if (!activeConv) {
     activeConv =
-      filtered.find((c) => c.status === 'CASCADE_RUN_STATUS_RUNNING' && c.turns.length > 0) ||
+      filtered.find((c) => c.status === 'CASCADE_RUN_STATUS_RUNNING' && c.turns.length > 0 && !c.parentId) ||
+      filtered.find((c) => c.turns.length > 0 && !c.parentId) ||
       filtered.find((c) => c.turns.length > 0) ||
       filtered[0] ||
       null;
@@ -719,6 +873,12 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
   let activeSession = null;
   if (activeConv) {
     const ctxState = resolveContextState(activeConv.turns);
+    let streamOutTokens = 0;
+    let streamDurSec = 0;
+    let ttftSum = 0;
+    let ttftCount = 0;
+    let lastTps = 0;
+
     const totals = activeConv.turns.reduce(
       (acc, t) => {
         acc.inputTokens += t.inputTokens;
@@ -728,6 +888,18 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
         acc.thinkingTokens += t.thinkingTokens;
         acc.textTokens += t.textTokens;
         acc.totalTokens += t.totalTokens;
+        const effSec = t.streamSec > 0.05 ? t.streamSec : t.latencySec > 0.05 ? t.latencySec : 0;
+        if (t.outputTokens > 0 && effSec > 0 && effSec <= 3600) {
+          streamOutTokens += t.outputTokens;
+          streamDurSec += effSec;
+        }
+        if (t.ttftSec > 0 && t.ttftSec < 120) {
+          ttftSum += t.ttftSec;
+          ttftCount += 1;
+        }
+        if (t.tps > 0) {
+          lastTps = t.tps;
+        }
         return acc;
       },
       {
@@ -741,6 +913,10 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
       }
     );
 
+    const avgTps = streamDurSec > 0.05 ? Math.round((streamOutTokens / streamDurSec) * 10) / 10 : 0;
+    const avgTtftSec = ttftCount > 0 ? Math.round((ttftSum / ttftCount) * 100) / 100 : 0;
+    const subagents = collectDescendantStats(conversations, activeConv.id);
+
     activeSession = {
       id: activeConv.id,
       title: activeConv.title,
@@ -749,6 +925,11 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
       status: activeConv.status,
       isCurrentEnv: Boolean(envConvId && activeConv.id === envConvId),
       turnsCount: activeConv.turns.length,
+      stepCount: activeConv.stepCount,
+      lastTps,
+      avgTps,
+      avgTtftSec,
+      subagents,
       lastActiveMs: activeConv.lastActiveMs,
       ...ctxState,
       ...totals,
@@ -763,23 +944,50 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
           family: t.family,
           inputTokens: t.inputTokens,
           cacheReadTokens: t.cacheReadTokens,
+          cacheWriteTokens: t.cacheWriteTokens,
+          cacheHitRate: computeCacheHitRate(t.inputTokens, t.cacheReadTokens),
           thinkingTokens: t.thinkingTokens,
           textTokens: t.textTokens,
           outputTokens: t.outputTokens,
           totalTokens: t.totalTokens,
           contextUsed: t.contextUsed,
           contextLimit: t.contextLimit,
+          tps: t.tps,
           latencySec: Math.round(t.latencySec * 100) / 100,
           ttftSec: Math.round(t.ttftSec * 100) / 100,
         })),
     };
   }
 
-  // Flatten turns across filtered conversations
-  const allTurns = [];
+  // Time boundaries: Today 00:00, Rolling 5h, and Calendar Week (Monday 00:00 -> Next Monday 00:00)
   const todayStart = new Date(nowMs);
   todayStart.setHours(0, 0, 0, 0);
   const todayStartMs = todayStart.getTime();
+
+  const dayOfWeek = todayStart.getDay(); // 0=Sun, 1=Mon...
+  const diffToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  const weekStartMs = todayStartMs - diffToMonday * 86_400_000;
+  const weekResetAtMs = weekStartMs + 7 * 86_400_000;
+
+  const cutoff5h = nowMs - WINDOW_5H_MS;
+  const rolling5hBuckets = Array.from({ length: 5 }, (_, idx) => {
+    const startMs = cutoff5h + idx * 3_600_000;
+    const d = new Date(startMs);
+    return {
+      label: `${String(d.getHours()).padStart(2, '0')}:00`,
+      totalTokens: 0,
+      inputTokens: 0,
+      cacheReadTokens: 0,
+      cacheHitRate: 0,
+      turnsCount: 0,
+      families: { gemini4: 0, flash: 0, claude: 0, other: 0 },
+    };
+  });
+
+  const allTurns = [];
+  const window5hTurns = [];
+  const pool5hTurns = { gemini4: [], claude: [], flash: [], other: [] };
+
   const todaySessionIds = new Set();
   let todayTokens = 0;
   let todayInput = 0;
@@ -789,31 +997,39 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
   let todayTtftCount = 0;
   let todayLatencySum = 0;
   let todayLatencyCount = 0;
+  const todayByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
 
-  const cutoff5h = nowMs - 5 * 3_600_000;
-  const rolling5hBuckets = Array.from({ length: 5 }, (_, idx) => {
-    const startMs = cutoff5h + idx * 3_600_000;
-    const d = new Date(startMs);
-    return {
-      label: `${String(d.getHours()).padStart(2, '0')}:00`,
-      totalTokens: 0,
-      turnsCount: 0,
-      families: { gemini4: 0, flash: 0, claude: 0, other: 0 },
-    };
-  });
   let rolling5hTotal = 0;
+  let rolling5hInput = 0;
+  let rolling5hCacheRead = 0;
   let rolling5hTurns = 0;
   const rolling5hByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
+  const rolling5hInputByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
+  const rolling5hCacheByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
+  const rolling5hTurnsByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
+
+  const weekSessionIds = new Set();
+  let calWeekTotal = 0;
+  let calWeekInput = 0;
+  let calWeekCacheRead = 0;
+  let calWeekTurns = 0;
+  const calWeekByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
+  const calWeekInputByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
+  const calWeekCacheByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
+  const calWeekTurnsByFamily = { gemini4: 0, flash: 0, claude: 0, other: 0 };
 
   for (const conv of filtered) {
     for (const t of conv.turns) {
       allTurns.push(t);
+      const fam = FAMILY_META[t.family] ? t.family : 'other';
+
       if (t.timestampMs >= todayStartMs) {
         todaySessionIds.add(conv.id);
         todayTokens += t.totalTokens;
         todayInput += t.inputTokens;
         todayCacheRead += t.cacheReadTokens;
         todayTurns += 1;
+        todayByFamily[fam] += t.totalTokens;
         if (t.ttftSec > 0 && t.ttftSec < 120) {
           todayTtftSum += t.ttftSec;
           todayTtftCount += 1;
@@ -823,17 +1039,43 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
           todayLatencyCount += 1;
         }
       }
+
+      if (t.timestampMs >= weekStartMs && t.timestampMs <= weekResetAtMs) {
+        weekSessionIds.add(conv.id);
+        calWeekTotal += t.totalTokens;
+        calWeekInput += t.inputTokens;
+        calWeekCacheRead += t.cacheReadTokens;
+        calWeekTurns += 1;
+        calWeekByFamily[fam] += t.totalTokens;
+        calWeekInputByFamily[fam] += t.inputTokens;
+        calWeekCacheByFamily[fam] += t.cacheReadTokens;
+        calWeekTurnsByFamily[fam] += 1;
+      }
+
       if (t.timestampMs >= cutoff5h && t.timestampMs <= nowMs + 60_000) {
         rolling5hTotal += t.totalTokens;
+        rolling5hInput += t.inputTokens;
+        rolling5hCacheRead += t.cacheReadTokens;
         rolling5hTurns += 1;
-        rolling5hByFamily[t.family] = (rolling5hByFamily[t.family] || 0) + t.totalTokens;
+        rolling5hByFamily[fam] += t.totalTokens;
+        rolling5hInputByFamily[fam] += t.inputTokens;
+        rolling5hCacheByFamily[fam] += t.cacheReadTokens;
+        rolling5hTurnsByFamily[fam] += 1;
+        window5hTurns.push(t);
+        pool5hTurns[fam].push(t);
         const bucketIdx = Math.min(4, Math.max(0, Math.floor((t.timestampMs - cutoff5h) / 3_600_000)));
         rolling5hBuckets[bucketIdx].totalTokens += t.totalTokens;
+        rolling5hBuckets[bucketIdx].inputTokens += t.inputTokens;
+        rolling5hBuckets[bucketIdx].cacheReadTokens += t.cacheReadTokens;
         rolling5hBuckets[bucketIdx].turnsCount += 1;
-        rolling5hBuckets[bucketIdx].families[t.family] =
-          (rolling5hBuckets[bucketIdx].families[t.family] || 0) + t.totalTokens;
+        rolling5hBuckets[bucketIdx].families[fam] =
+          (rolling5hBuckets[bucketIdx].families[fam] || 0) + t.totalTokens;
       }
     }
+  }
+
+  for (const b of rolling5hBuckets) {
+    b.cacheHitRate = computeCacheHitRate(b.inputTokens, b.cacheReadTokens);
   }
 
   const mini7d = buildDailyBuckets(allTurns, 7, nowMs);
@@ -846,9 +1088,31 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
     }
   }
 
+  const poolKeys = ['gemini4', 'claude', 'flash'];
+  if (rolling5hByFamily.other > 0 || calWeekByFamily.other > 0 || todayByFamily.other > 0) {
+    poolKeys.push('other');
+  }
+  const quotaPools = poolKeys.map((key) => {
+    const meta = FAMILY_META[key];
+    return {
+      key,
+      label: meta.label,
+      poolLabel: meta.poolLabel,
+      tokens5h: rolling5hByFamily[key] || 0,
+      turns5h: rolling5hTurnsByFamily[key] || 0,
+      cacheHit5h: computeCacheHitRate(rolling5hInputByFamily[key] || 0, rolling5hCacheByFamily[key] || 0),
+      tokensPerHour5h: Math.round((rolling5hByFamily[key] || 0) / 5),
+      rolloff5h: compute5hRolloff(pool5hTurns[key], nowMs),
+      tokensWeek: calWeekByFamily[key] || 0,
+      turnsWeek: calWeekTurnsByFamily[key] || 0,
+      cacheHitWeek: computeCacheHitRate(calWeekInputByFamily[key] || 0, calWeekCacheByFamily[key] || 0),
+      tokensToday: todayByFamily[key] || 0,
+    };
+  });
+
   const recentSessions = filtered
-    .filter((c) => c.turns.length > 0)
-    .slice(0, 15)
+    .filter((c) => c.turns.length > 0 && !c.parentId)
+    .slice(0, 20)
     .map((c) => {
       const ctx = resolveContextState(c.turns);
       const total = c.turns.reduce((sum, t) => sum + t.totalTokens, 0);
@@ -858,18 +1122,37 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
         project: c.project,
         surface: c.surface,
         status: c.status,
+        isCurrentEnv: Boolean(envConvId && c.id === envConvId),
         modelLabel: ctx.modelLabel,
         contextPct: ctx.contextPct,
         totalTokens: total,
         turnsCount: c.turns.length,
+        stepCount: c.stepCount,
         lastActiveMs: c.lastActiveMs,
       };
     });
 
+  if (activeSession && !recentSessions.some((s) => s.id === activeSession.id)) {
+    recentSessions.unshift({
+      id: activeSession.id,
+      title: activeSession.title,
+      project: activeSession.project,
+      surface: activeSession.surface,
+      status: activeSession.status,
+      isCurrentEnv: activeSession.isCurrentEnv,
+      modelLabel: activeSession.modelLabel,
+      contextPct: activeSession.contextPct,
+      totalTokens: activeSession.totalTokens,
+      turnsCount: activeSession.turnsCount,
+      stepCount: activeSession.stepCount,
+      lastActiveMs: activeSession.lastActiveMs,
+    });
+  }
+
   const surfaceCounts = {
-    all: conversations.length,
-    desktop: conversations.filter((c) => c.surface === 'desktop').length,
-    cli: conversations.filter((c) => c.surface === 'cli').length,
+    all: conversations.filter((c) => !c.parentId).length || conversations.length,
+    desktop: conversations.filter((c) => c.surface === 'desktop' && !c.parentId).length,
+    cli: conversations.filter((c) => c.surface === 'cli' && !c.parentId).length,
   };
 
   return {
@@ -891,11 +1174,28 @@ export function getSnapshot({ surface = 'all', conversationId = null } = {}) {
     },
     rolling5h: {
       totalTokens: rolling5hTotal,
+      inputTokens: rolling5hInput,
+      cacheReadTokens: rolling5hCacheRead,
+      cacheHitRate: computeCacheHitRate(rolling5hInput, rolling5hCacheRead),
       turnsCount: rolling5hTurns,
       tokensPerHour: Math.round(rolling5hTotal / 5),
       buckets: rolling5hBuckets,
       byFamily: rolling5hByFamily,
+      rolloff: compute5hRolloff(window5hTurns, nowMs),
     },
+    calendarWeek: {
+      startMs: weekStartMs,
+      resetAtMs: weekResetAtMs,
+      resetInSec: Math.max(0, Math.round((weekResetAtMs - nowMs) / 1000)),
+      totalTokens: calWeekTotal,
+      inputTokens: calWeekInput,
+      cacheReadTokens: calWeekCacheRead,
+      cacheHitRate: computeCacheHitRate(calWeekInput, calWeekCacheRead),
+      turnsCount: calWeekTurns,
+      sessionsCount: weekSessionIds.size,
+      byFamily: calWeekByFamily,
+    },
+    quotaPools,
     weekSummary: {
       totalTokens: weekTotalTokens,
       byFamily: weekByFamily,
@@ -966,6 +1266,8 @@ export function getAnalytics({ surface = 'all', days = 7, family = 'all' } = {})
         cacheReadTokens: 0,
         outputTokens: 0,
         thinkingTokens: 0,
+        streamOutTokens: 0,
+        streamDurSec: 0,
         turnsCount: 0,
       };
       mEntry.totalTokens += t.totalTokens;
@@ -973,6 +1275,11 @@ export function getAnalytics({ surface = 'all', days = 7, family = 'all' } = {})
       mEntry.cacheReadTokens += t.cacheReadTokens;
       mEntry.outputTokens += t.outputTokens;
       mEntry.thinkingTokens += t.thinkingTokens;
+      const effSec = t.streamSec > 0.05 ? t.streamSec : t.latencySec > 0.05 ? t.latencySec : 0;
+      if (t.outputTokens > 0 && effSec > 0 && effSec <= 3600) {
+        mEntry.streamOutTokens += t.outputTokens;
+        mEntry.streamDurSec += effSec;
+      }
       mEntry.turnsCount += 1;
       byModelMap.set(t.modelLabel, mEntry);
 
@@ -1007,7 +1314,9 @@ export function getAnalytics({ surface = 'all', days = 7, family = 'all' } = {})
         surface: conv.surface,
         modelLabel: sessModel,
         totalTokens: sessTokens,
+        cacheReadTokens: sessCacheRead,
         turnsCount: sessTurns,
+        stepCount: conv.stepCount,
         cacheHitRate: computeCacheHitRate(sessInput, sessCacheRead),
         lastActiveMs: conv.lastActiveMs,
       });
@@ -1017,7 +1326,15 @@ export function getAnalytics({ surface = 'all', days = 7, family = 'all' } = {})
   const daily = buildDailyBuckets(matchingTurns, safeDays, nowMs);
   const byModel = Array.from(byModelMap.values())
     .map((m) => ({
-      ...m,
+      name: m.name,
+      family: m.family,
+      totalTokens: m.totalTokens,
+      inputTokens: m.inputTokens,
+      cacheReadTokens: m.cacheReadTokens,
+      outputTokens: m.outputTokens,
+      thinkingTokens: m.thinkingTokens,
+      turnsCount: m.turnsCount,
+      avgTps: m.streamDurSec > 0.05 ? Math.round((m.streamOutTokens / m.streamDurSec) * 10) / 10 : 0,
       cacheHitRate: computeCacheHitRate(m.inputTokens, m.cacheReadTokens),
     }))
     .sort((a, b) => b.totalTokens - a.totalTokens);
@@ -1026,6 +1343,7 @@ export function getAnalytics({ surface = 'all', days = 7, family = 'all' } = {})
     .map((p) => ({
       name: p.name,
       totalTokens: p.totalTokens,
+      cacheReadTokens: p.cacheReadTokens,
       turnsCount: p.turnsCount,
       sessionsCount: p.sessions.size,
       cacheHitRate: computeCacheHitRate(p.inputTokens, p.cacheReadTokens),
